@@ -1,162 +1,152 @@
-"""Test de faisabilité des trois sources de données du projet.
+"""Test de faisabilité des sources de taux souverains à 10 ans.
 
-Le script interroge chaque source et affiche ce qui est réellement disponible
-(nombre d'observations, première et dernière date, valeurs manquantes) :
+Le script interroge chaque source et affiche ce qui est réellement disponible :
+nombre d'observations, première et dernière date, valeurs manquantes par pays,
+puis le contrôle de cohérence demandé : la moyenne mensuelle de chaque série
+quotidienne doit retomber sur la série mensuelle de la BCE.
 
-1. l'API du ECB Data Portal (taux de la facilité de dépôt, niveau et variation) ;
-2. les dates des réunions de politique monétaire, lues dans les listes annuelles
-   de communiqués du site de la BCE ;
-3. les cours quotidiens via yfinance (indices sectoriels STOXX, banques, ETF).
+Sources :
+1. Eurostat, série quotidienne irt_lt_mcby_d via l'API Eurostat, puis la copie
+   de cette série conservée par DBnomics ;
+2. BCE, jeu IRS mensuel, taux à long terme du critère de convergence ;
+3. sources nationales quotidiennes : Banque de France (TEC 10, copie DBnomics)
+   et Bundesbank (rendement à 10 ans issu de la courbe des taux).
 
 Usage : python scripts/check_sources.py
 """
 
 import io
-import logging
-import re
 
 import pandas as pd
 import requests
-import yfinance as yf
 
-START = "2021-12-01"  # un mois de marge avant la fenêtre d'étude 2022-2026
-YEARS = range(2022, 2027)
+START = "2018-01-01"
+END = "2026-09-30"
+COUNTRIES = ["DE", "FR", "IT", "ES", "PT", "BE", "NL"]
+MIN_DAYS_PER_MONTH = 15  # un mois n'est comparé que s'il compte au moins 15 cotations
 
-ECB_API = (
-    "https://data-api.ecb.europa.eu/service/data/FM/"
-    "B.U2.EUR.4F.KR.DFR.{suffix}?format=csvdata"
+EUROSTAT_URL = (
+    "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/"
+    "irt_lt_mcby_d?format=SDMX-CSV&startPeriod=2018-01-01"
 )
-ECB_PRESS_INDEX = "https://www.ecb.europa.eu/press/govcdec/mopo/html/index.en.html"
-
-# Indices sectoriels STOXX Europe 600 (symboles Yahoo supposés) et deux indices
-# témoins dont on sait qu'ils existent sur Yahoo.
-SECTOR_INDICES = ["^SX7P", "^SX8P", "^SX6P", "^SX86P", "^STOXX", "^STOXX50E"]
-
-BANKS = ["BNP.PA", "GLE.PA", "ACA.PA", "DBK.DE", "SAN.MC", "ISP.MI", "UCG.MI", "INGA.AS"]
-
-# ETF iShares STOXX Europe 600 sectoriels cotés sur Xetra (suffixe .DE sur Yahoo).
-# Le libellé est celui renvoyé par Yahoo, vérifié ticker par ticker.
-ETFS = {
-    "EXSA.DE": "STOXX Europe 600 (indice large, référence)",
-    "EXV1.DE": "Banks",
-    "EXX1.DE": "EURO STOXX Banks (zone euro seulement)",
-    "EXH2.DE": "Financial Services",
-    "EXH5.DE": "Insurance",
-    "EXI5.DE": "Real Estate",
-    "EXH9.DE": "Utilities",
-    "EXV3.DE": "Technology",
-    "EXV2.DE": "Telecommunications",
-    "EXV4.DE": "Health Care",
-    "EXH3.DE": "Food & Beverage",
-    "EXH7.DE": "Personal & Household Goods",
-    "EXH1.DE": "Oil & Gas",
-    "EXV5.DE": "Automobiles & Parts",
-    "EXH4.DE": "Industrial Goods & Services",
-    "EXV6.DE": "Basic Resources",
-    "EXV7.DE": "Chemicals",
-    "EXV8.DE": "Construction & Materials",
-    "EXV9.DE": "Travel & Leisure",
-    "EXH6.DE": "Media",
-    "EXH8.DE": "Retail",
-}
+DBNOMICS_URL = "https://api.db.nomics.world/v22/series/{series}?observations=1"
+ECB_URL = (
+    "https://data-api.ecb.europa.eu/service/data/IRS/"
+    "M.{countries}.L.L40.CI.0000.EUR.N.Z?format=csvdata&startPeriod=2018-01"
+)
+BUNDESBANK_URL = (
+    "https://www.bundesbank.de/statistic-rmi/StatisticDownload"
+    "?tsId=BBSIS.D.I.ZAR.ZI.EUR.S1311.B.A604.R10XX.R.A.A._Z._Z.A"
+    "&its_csvFormat=en&its_fileFormat=csv&mode=its"
+    f"&its_from={START}&its_to={END}"
+)
 
 
-def fetch_ecb_series(suffix):
-    """Télécharge une série de l'API BCE et renvoie un DataFrame (date, valeur).
+def fetch_eurostat_daily_status():
+    """Interroge l'API Eurostat pour irt_lt_mcby_d ; renvoie le code HTTP et le début de la réponse."""
+    response = requests.get(EUROSTAT_URL, timeout=60)
+    return response.status_code, response.text[:160].replace("\n", " ")
 
-    `suffix` vaut "LEV" (niveau du taux) ou "CHG" (variation en points de %).
+
+def fetch_dbnomics_daily(series):
+    """Télécharge une série quotidienne sur DBnomics et renvoie une Series datée.
+
+    `series` est l'identifiant complet "fournisseur/jeu/code". Les jours sans
+    valeur (week-ends, fériés) sont conservés comme NaN pour pouvoir les compter.
     """
-    response = requests.get(ECB_API.format(suffix=suffix), timeout=60)
+    response = requests.get(DBNOMICS_URL.format(series=series), timeout=60)
     response.raise_for_status()
-    raw = pd.read_csv(io.StringIO(response.text), usecols=["TIME_PERIOD", "OBS_VALUE"])
-    return pd.DataFrame(
-        {"date": pd.to_datetime(raw["TIME_PERIOD"]), "value": raw["OBS_VALUE"]}
-    )
+    doc = response.json()["series"]["docs"][0]
+    values = pd.to_numeric(pd.Series(doc["value"]).replace("NA", None), errors="coerce")
+    daily = pd.Series(values.values, index=pd.to_datetime(doc["period"]), name=series)
+    return daily[START:END]
 
 
-def describe_dates(label, dates, n_missing):
-    """Affiche une ligne de synthèse : effectif, première et dernière date, NA."""
+def fetch_ecb_monthly(countries):
+    """Télécharge le taux à long terme mensuel de la BCE (jeu IRS) pour plusieurs pays.
+
+    Renvoie un DataFrame (country, month, value), `month` au format AAAA-MM.
+    """
+    response = requests.get(ECB_URL.format(countries="+".join(countries)), timeout=60)
+    response.raise_for_status()
+    raw = pd.read_csv(io.StringIO(response.text), usecols=["REF_AREA", "TIME_PERIOD", "OBS_VALUE"])
+    return raw.rename(columns={"REF_AREA": "country", "TIME_PERIOD": "month", "OBS_VALUE": "value"})
+
+
+def fetch_bundesbank_daily():
+    """Télécharge le rendement quotidien à 10 ans des titres fédéraux (Bundesbank).
+
+    Le CSV commence par des lignes de métadonnées, puis donne une ligne par jour
+    civil avec "." quand il n'y a pas de cotation. Renvoie une Series datée avec NaN.
+    """
+    response = requests.get(BUNDESBANK_URL, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    rows = [line.split(",")[:2] for line in response.text.splitlines() if line[:4].isdigit()]
+    table = pd.DataFrame(rows, columns=["date", "value"])
+    values = pd.to_numeric(table["value"].replace(".", None), errors="coerce")
+    return pd.Series(values.values, index=pd.to_datetime(table["date"]), name="Bundesbank")
+
+
+def describe_daily(label, daily):
+    """Affiche effectif, dates extrêmes et jours ouvrés sans valeur d'une série quotidienne."""
+    valid = daily.dropna()
+    if valid.empty:
+        print(f"{label:<24} aucune valeur")
+        return
+    weekdays = daily[daily.index.dayofweek < 5]
+    covers_end = "oui" if valid.index.max() >= pd.Timestamp(END) else "non"
     print(
-        f"{label:<42} n={len(dates):5d}  "
-        f"{min(dates).date()} -> {max(dates).date()}  NA={n_missing}"
+        f"{label:<24} n={len(valid):5d}  {valid.index.min().date()} -> {valid.index.max().date()}  "
+        f"jours ouvrés sans valeur={int(weekdays.isna().sum()):3d}  couvre {END} : {covers_end}"
     )
 
 
-def fetch_meeting_dates(years):
-    """Renvoie les dates d'annonce des décisions de politique monétaire.
+def compare_with_ecb(daily, ecb_country):
+    """Compare la moyenne mensuelle d'une série quotidienne à la série mensuelle de la BCE.
 
-    La page d'index charge dynamiquement des fragments annuels dont les URL
-    sont listées dans l'attribut `data-snippets`. Chaque fragment est du HTML
-    statique où les communiqués de décision ont une URL de la forme
-    `ecb.mpAAMMJJ` ; la date d'annonce est lue directement dans cette URL.
+    Seuls les mois comptant au moins MIN_DAYS_PER_MONTH cotations sont comparés.
+    Renvoie (mois comparés, écart absolu moyen, écart absolu maximal) en points de %.
     """
-    index_html = requests.get(ECB_PRESS_INDEX, timeout=60).text
-    snippets = re.search(r"data-snippets='([^']+)'", index_html).group(1).split(",")
-    dates = set()
-    for year in years:
-        path = next(s for s in snippets if f"/{year}/" in s)  # "../2024/html/index_include.en.html"
-        url = ECB_PRESS_INDEX.rsplit("/", 2)[0] + path.lstrip(".")
-        html = requests.get(url, timeout=60).text
-        for yymmdd in re.findall(r"ecb\.mp(\d{6})", html):
-            dates.add(pd.to_datetime(yymmdd, format="%y%m%d"))
-    return sorted(dates)
-
-
-def describe_prices(label, tickers):
-    """Télécharge les cours et affiche, par ticker, la couverture réelle.
-
-    Pour chaque ticker : nombre de clôtures valides, première et dernière date,
-    NA à l'intérieur de cette plage et jours à volume nul (séances sans échange,
-    signe d'un ETF peu liquide dont la clôture peut être peu informative).
-    Le téléchargement groupé aligne tous les tickers sur l'union des calendriers
-    de bourse : un NA signale donc le plus souvent un jour férié local (par
-    exemple Francfort fermé alors que Paris est ouvert), pas une donnée perdue.
-    """
-    print(f"\n--- {label} ---")
-    data = yf.download(tickers, start=START, auto_adjust=False, progress=False)
-    for ticker in tickers:
-        close = data["Close"].get(ticker)
-        if close is None or close.notna().sum() == 0:
-            print(f"{ticker:<10} ABSENT de Yahoo Finance")
-            continue
-        close = close.loc[close.first_valid_index(): close.last_valid_index()]
-        volume = data["Volume"][ticker].reindex(close.index)
-        print(
-            f"{ticker:<10} n={close.notna().sum():5d}  "
-            f"{close.index.min().date()} -> {close.index.max().date()}  "
-            f"NA_calendrier_commun={close.isna().sum()}  volume_nul={(volume == 0).sum()}"
-        )
+    valid = daily.dropna()
+    monthly = valid.groupby(valid.index.strftime("%Y-%m")).agg(["mean", "count"])
+    monthly = monthly[monthly["count"] >= MIN_DAYS_PER_MONTH]
+    merged = monthly.join(ecb_country.set_index("month")["value"], how="inner")
+    gap = (merged["mean"] - merged["value"]).abs()
+    return len(merged), gap.mean(), gap.max()
 
 
 def main():
-    print("=== 1. API BCE : taux de la facilité de dépôt (dates d'entrée en vigueur) ===")
-    level = fetch_ecb_series("LEV")
-    change = fetch_ecb_series("CHG")
-    describe_dates("DFR niveau (LEV), série complète", level["date"], level["value"].isna().sum())
-    describe_dates("DFR variation (CHG), série complète", change["date"], change["value"].isna().sum())
-    change_window = change[change["date"] >= "2022-01-01"]
-    describe_dates("DFR variation, fenêtre 2022-2026", change_window["date"], change_window["value"].isna().sum())
+    print(f"Période visée : {START} -> {END}\n")
 
-    print("\n=== 2. Site BCE : dates d'annonce des décisions (communiqués ecb.mpAAMMJJ) ===")
-    meetings = fetch_meeting_dates(YEARS)
-    describe_dates("Réunions de politique monétaire", meetings, 0)
-    per_year = pd.Series([d.year for d in meetings]).value_counts().sort_index()
-    print("Réunions par an :", per_year.to_dict())
-    # Contrôle de cohérence : depuis 2022 une décision annoncée un jeudi entre en
-    # vigueur le mercredi suivant, soit 6 jours plus tard.
-    announced = {d + pd.Timedelta(days=6) for d in meetings}
-    matched = change_window["date"].isin(announced).sum()
-    print(
-        f"Variations de taux 2022-2026 : {len(change_window)}, "
-        f"dont {matched} précédées d'une réunion exactement 6 jours avant"
-    )
+    print("=== 1. Eurostat : série quotidienne irt_lt_mcby_d via l'API Eurostat ===")
+    status, message = fetch_eurostat_daily_status()
+    print(f"HTTP {status} : {message}\n")
 
-    print("\n=== 3. yfinance : cours quotidiens ===")
-    describe_prices("Indices sectoriels STOXX (symboles Yahoo)", SECTOR_INDICES)
-    describe_prices("Grandes banques de la zone euro", BANKS)
-    describe_prices("ETF iShares STOXX Europe 600 sectoriels (Xetra)", list(ETFS))
+    print("=== 2. BCE : jeu IRS mensuel, taux à long terme du critère de convergence ===")
+    ecb = fetch_ecb_monthly(COUNTRIES)
+    for country in COUNTRIES:
+        part = ecb[ecb["country"] == country]
+        print(f"{country}  n={len(part):4d}  {part['month'].min()} -> {part['month'].max()}  NA={int(part['value'].isna().sum())}")
+
+    print("\n=== 3. Copie DBnomics de la série quotidienne Eurostat ===")
+    checks = []
+    for country in COUNTRIES:
+        daily = fetch_dbnomics_daily(f"Eurostat/IRT_LT_MCBY_D/D.MCBY.{country}")
+        describe_daily(f"Eurostat {country}", daily)
+        checks.append(("Eurostat via DBnomics", country, *compare_with_ecb(daily, ecb[ecb["country"] == country])))
+
+    print("\n=== 4. Sources nationales quotidiennes ===")
+    tec10 = fetch_dbnomics_daily("BDF/FM/D.FR.EUR.FR2.BB.FRMOYTEC10.HSTA")
+    describe_daily("Banque de France TEC 10", tec10)
+    checks.append(("Banque de France TEC 10", "FR", *compare_with_ecb(tec10, ecb[ecb["country"] == "FR"])))
+    bund = fetch_bundesbank_daily()
+    describe_daily("Bundesbank 10 ans", bund)
+    checks.append(("Bundesbank 10 ans", "DE", *compare_with_ecb(bund, ecb[ecb["country"] == "DE"])))
+
+    print("\n=== 5. Contrôle : moyenne mensuelle du quotidien contre série mensuelle BCE (points de %) ===")
+    table = pd.DataFrame(checks, columns=["source", "pays", "mois comparés", "écart abs. moyen", "écart abs. max"])
+    print(table.round(3).to_string(index=False))
 
 
 if __name__ == "__main__":
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)  # masque les avertissements des tickers absents
     main()
