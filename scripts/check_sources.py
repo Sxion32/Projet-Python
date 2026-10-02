@@ -9,12 +9,14 @@ Sources :
 1. Eurostat, série quotidienne irt_lt_mcby_d via l'API Eurostat, puis la copie
    de cette série conservée par DBnomics ;
 2. BCE, jeu IRS mensuel, taux à long terme du critère de convergence ;
-3. sources nationales quotidiennes : Banque de France (TEC 10, copie DBnomics)
-   et Bundesbank (rendement à 10 ans issu de la courbe des taux).
+3. sources nationales quotidiennes : Banque de France (TEC 10, copie DBnomics),
+   Bundesbank (rendement à 10 ans issu de la courbe des taux) et Banco de España
+   (obligations de l'État à 10 ans, tableau TI 1.3).
 
 Usage : python scripts/check_sources.py
 """
 
+import csv
 import io
 
 import pandas as pd
@@ -40,6 +42,9 @@ BUNDESBANK_URL = (
     "&its_csvFormat=en&its_fileFormat=csv&mode=its"
     f"&its_from={START}&its_to={END}"
 )
+BDE_URL = "https://www.bde.es/webbe/es/estadisticas/compartido/datos/csv/ti_1_3.csv"
+BDE_MONTHS = {"ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6,
+              "JUL": 7, "AGO": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12}
 
 
 def fetch_eurostat_daily_status():
@@ -85,6 +90,29 @@ def fetch_bundesbank_daily():
     table = pd.DataFrame(rows, columns=["date", "value"])
     values = pd.to_numeric(table["value"].replace(".", None), errors="coerce")
     return pd.Series(values.values, index=pd.to_datetime(table["date"]), name="Bundesbank")
+
+
+def fetch_bde_daily():
+    """Télécharge le taux quotidien à 10 ans des obligations de l'État espagnol (Banco de España).
+
+    Le tableau TI 1.3 regroupe plusieurs séries en colonnes, précédées de lignes
+    de métadonnées ; la colonne utile est repérée par sa description. Les dates
+    s'écrivent avec un mois abrégé en espagnol ("30 SEP 2026") et "_" signale
+    l'absence de valeur. Renvoie une Series datée avec NaN.
+    """
+    response = requests.get(BDE_URL, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    rows = list(csv.reader(io.StringIO(response.content.decode("latin-1"))))
+    descriptions = next(r for r in rows if r and r[0].startswith("DESCRIPCIÓN DE LA SERIE"))
+    column = next(i for i, d in enumerate(descriptions) if "10 Años" in d and "obligaciones" in d.lower())
+    data = [r for r in rows if r and r[0][:1].isdigit()]
+    dates = []
+    for row in data:
+        day, month, year = row[0].split()
+        dates.append(f"{year}-{BDE_MONTHS[month.upper()]:02d}-{int(day):02d}")
+    values = pd.to_numeric(pd.Series([r[column] for r in data]).replace({"_": None, "": None}), errors="coerce")
+    daily = pd.Series(values.values, index=pd.to_datetime(dates), name="Banco de España").sort_index()
+    return daily[START:END]
 
 
 def describe_daily(label, daily):
@@ -142,6 +170,9 @@ def main():
     bund = fetch_bundesbank_daily()
     describe_daily("Bundesbank 10 ans", bund)
     checks.append(("Bundesbank 10 ans", "DE", *compare_with_ecb(bund, ecb[ecb["country"] == "DE"])))
+    bde = fetch_bde_daily()
+    describe_daily("Banco de España 10 ans", bde)
+    checks.append(("Banco de España 10 ans", "ES", *compare_with_ecb(bde, ecb[ecb["country"] == "ES"])))
 
     print("\n=== 5. Contrôle : moyenne mensuelle du quotidien contre série mensuelle BCE (points de %) ===")
     table = pd.DataFrame(checks, columns=["source", "pays", "mois comparés", "écart abs. moyen", "écart abs. max"])
