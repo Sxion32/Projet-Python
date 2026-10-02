@@ -1,11 +1,28 @@
+# Environnements virtuels
 .venv/
+venv/
+
+# Caches Python et Jupyter
 __pycache__/
-.ipynb_checkpoints/
 *.pyc
 *.pyo
-.DS_Store
-.env
-.env.*
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Rapports de couverture et journaux
 coverage/
 htmlcov/
 *.log
+
+# Fichiers système et d'éditeur
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+
+# Données temporaires. Le cache des données brutes (data/raw/) reste versionné
+# pour garantir la reproductibilité du notebook.
+data/tmp/
